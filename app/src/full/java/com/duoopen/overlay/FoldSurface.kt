@@ -13,6 +13,8 @@ import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.view.SurfaceControl
+import org.lsposed.hiddenapibypass.HiddenApiBypass
 import android.view.animation.DecelerateInterpolator
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.FoldLine
@@ -105,6 +107,63 @@ class SnapshotSurface(
     private companion object {
         const val TAG = "DuoOverlay"
     }
+    private object SamsungBlurRegions {
+
+    fun set(
+        view: View,
+        width: Int,
+        height: Int,
+        radius: Int,
+    ): Boolean {
+        if (width <= 0 || height <= 0) return false
+
+        return runCatching {
+            val root = view.rootView.parent ?: return false
+
+            val surfaceControl = HiddenApiBypass.invoke(
+                root.javaClass,
+                root,
+                "getSurfaceControl",
+            ) as? SurfaceControl ?: return false
+
+            if (!surfaceControl.isValid) return false
+
+            // SurfaceFlinger BlurRegion format:
+            // radius, alpha, left, top, right, bottom,
+            // cornerTL, cornerTR, cornerBL, cornerBR
+            val regions = arrayOf(
+                floatArrayOf(
+                    radius.toFloat(),
+                    1.0f,
+                    0f,
+                    0f,
+                    width.toFloat(),
+                    height.toFloat(),
+                    0f,
+                    0f,
+                    0f,
+                    0f,
+                )
+            )
+
+            SurfaceControl.Transaction().use { transaction ->
+                HiddenApiBypass.invoke(
+                    SurfaceControl.Transaction::class.java,
+                    transaction,
+                    "setBlurRegions",
+                    surfaceControl,
+                    regions,
+                )
+
+                transaction.apply()
+            }
+
+            true
+        }.onFailure {
+            Log.e("DuoOverlay", "Samsung setBlurRegions failed", it)
+        }.getOrDefault(false)
+    }
+    }
 }
 
 /**
@@ -128,6 +187,9 @@ class LiveBlurSurface(
     }
 
     private val strips = ArrayList<Strip>()
+    private val normalWindowBlur =
+    runCatching { windowManager.isCrossWindowBlurEnabled }
+        .getOrDefault(false)
     private val darkPerPx = config.darkening * REFERENCE_PX_PER_MM / pxPerMm
     private var fade: ValueAnimator? = null
     /** 0..1 multiplier used by fade-in/out so a fade reads as the frost easing, not a popping window. */
@@ -197,10 +259,36 @@ class LiveBlurSurface(
                 (darkPerPx * rFar).coerceIn(0f, MAX_DARK),
             )
             if (radius != strip.radius) {
-                strip.radius = radius
-                strip.params.blurBehindRadius = radius
-                runCatching { windowManager.updateViewLayout(strip.view, strip.params) }
+    strip.radius = radius
+
+    if (normalWindowBlur) {
+        // Normaler Android / OnePlus Pfad
+        strip.params.blurBehindRadius = radius
+        runCatching {
+            windowManager.updateViewLayout(strip.view, strip.params)
+        }
+    } else {
+        // Samsung: SurfaceFlinger blurRegions direkt benutzen
+        val applied = SamsungBlurRegions.set(
+            strip.view,
+            strip.params.width,
+            strip.params.height,
+            radius,
+        )
+
+        // Direkt nach addView kann das SurfaceControl noch nicht bereit sein.
+        if (!applied) {
+            strip.view.post {
+                SamsungBlurRegions.set(
+                    strip.view,
+                    strip.params.width,
+                    strip.params.height,
+                    strip.radius,
+                )
             }
+        }
+    }
+}
         }
     }
 
