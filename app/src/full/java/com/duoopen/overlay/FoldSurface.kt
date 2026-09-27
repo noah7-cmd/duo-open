@@ -18,7 +18,6 @@ import android.view.animation.DecelerateInterpolator
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.FoldLine
 import com.duoopen.settings.DuoConfig
-import org.lsposed.hiddenapibypass.HiddenApiBypass
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -40,31 +39,27 @@ private fun overlayParams(
     height: Int,
     format: Int,
     extraFlags: Int = 0,
-) =
-    WindowManager.LayoutParams(
-        width,
-        height,
-        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
-            extraFlags,
-        format,
-    ).apply {
-        gravity = Gravity.TOP or Gravity.START
-        layoutInDisplayCutoutMode =
-            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        fitInsetsTypes = 0
-        title = "DuoOpenFold"
-    }
+) = WindowManager.LayoutParams(
+    width,
+    height,
+    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+        WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
+        extraFlags,
+    format,
+).apply {
+    gravity = Gravity.TOP or Gravity.START
+    layoutInDisplayCutoutMode =
+        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+    fitInsetsTypes = 0
+    title = "DuoOpenFold"
+}
 
 /**
- * Experimental Samsung path.
- *
- * Samsung exposes SurfaceFlinger blurRegions internally even when
- * WindowManager.isCrossWindowBlurEnabled reports false.
+ * Experimental Samsung SurfaceFlinger blurRegions backend.
  */
 private object SamsungBlurRegions {
 
@@ -74,32 +69,49 @@ private object SamsungBlurRegions {
         height: Int,
         radius: Int,
     ): Boolean {
-        if (width <= 0 || height <= 0) return false
+        if (width <= 0 || height <= 0) {
+            return false
+        }
 
-        return runCatching {
+        return try {
             val root = view.rootView.parent ?: return false
 
-            val surfaceControl = HiddenApiBypass.invoke(
-                root.javaClass,
-                root,
-                "getSurfaceControl",
-            ) as? SurfaceControl ?: return false
+            val getSurfaceControlMethod =
+                root.javaClass.declaredMethods.firstOrNull {
+                    it.name == "getSurfaceControl" &&
+                        it.parameterTypes.isEmpty()
+                } ?: run {
+                    Log.e(TAG, "getSurfaceControl method not found")
+                    return false
+                }
 
-            if (!surfaceControl.isValid) return false
+            getSurfaceControlMethod.isAccessible = true
+
+            val surfaceControl =
+                getSurfaceControlMethod.invoke(root) as? SurfaceControl
+                    ?: run {
+                        Log.e(TAG, "getSurfaceControl returned null")
+                        return false
+                    }
+
+            if (!surfaceControl.isValid) {
+                Log.e(TAG, "SurfaceControl is not valid")
+                return false
+            }
 
             /*
-             * SurfaceFlinger BlurRegion format:
+             * BlurRegion float array:
              *
-             * radius
-             * alpha
-             * left
-             * top
-             * right
-             * bottom
-             * cornerTL
-             * cornerTR
-             * cornerBL
-             * cornerBR
+             * 0 radius
+             * 1 alpha
+             * 2 left
+             * 3 top
+             * 4 right
+             * 5 bottom
+             * 6 corner top-left
+             * 7 corner top-right
+             * 8 corner bottom-left
+             * 9 corner bottom-right
              */
             val regions = arrayOf(
                 floatArrayOf(
@@ -116,27 +128,49 @@ private object SamsungBlurRegions {
                 )
             )
 
-            SurfaceControl.Transaction().use { transaction ->
-                HiddenApiBypass.invoke(
-                    SurfaceControl.Transaction::class.java,
+            val transaction = SurfaceControl.Transaction()
+
+            try {
+                val setBlurRegionsMethod =
+                    SurfaceControl.Transaction::class.java.declaredMethods
+                        .firstOrNull {
+                            it.name == "setBlurRegions" &&
+                                it.parameterTypes.size == 2
+                        } ?: run {
+                        Log.e(TAG, "setBlurRegions method not found")
+                        return false
+                    }
+
+                setBlurRegionsMethod.isAccessible = true
+
+                setBlurRegionsMethod.invoke(
                     transaction,
-                    "setBlurRegions",
                     surfaceControl,
                     regions,
                 )
 
                 transaction.apply()
+
+                Log.d(
+                    TAG,
+                    "Samsung blurRegions applied: radius=$radius size=${width}x$height"
+                )
+            } finally {
+                transaction.close()
             }
 
             true
-        }.onFailure {
+        } catch (t: Throwable) {
             Log.e(
-                "DuoOverlay",
+                TAG,
                 "Samsung setBlurRegions failed",
-                it,
+                t,
             )
-        }.getOrDefault(false)
+            false
+        }
     }
+
+    private const val TAG = "DuoOverlay"
 }
 
 /**
@@ -163,23 +197,22 @@ class SnapshotSurface(
     val attached: Boolean
 
     init {
-        attached =
-            runCatching {
-                windowManager.addView(
-                    view,
-                    overlayParams(
-                        WindowManager.LayoutParams.MATCH_PARENT,
-                        WindowManager.LayoutParams.MATCH_PARENT,
-                        PixelFormat.OPAQUE,
-                    ),
-                )
-            }.onFailure {
-                Log.e(
-                    TAG,
-                    "addView failed",
-                    it,
-                )
-            }.isSuccess
+        attached = runCatching {
+            windowManager.addView(
+                view,
+                overlayParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    PixelFormat.OPAQUE,
+                ),
+            )
+        }.onFailure {
+            Log.e(
+                TAG,
+                "addView failed",
+                it,
+            )
+        }.isSuccess
     }
 
     override var tilt: Float
@@ -188,12 +221,9 @@ class SnapshotSurface(
             view.tilt = value
         }
 
-    /**
-     * Swap a stale bridging picture for the fresh capture,
-     * keeping the current tilt.
-     */
-    fun replaceSnapshot(bitmap: Bitmap) =
+    fun replaceSnapshot(bitmap: Bitmap) {
         view.setSnapshot(bitmap)
+    }
 
     override fun fadeIn(durationMs: Long) {
         view.alpha = 0f
@@ -228,14 +258,11 @@ class SnapshotSurface(
 }
 
 /**
- * The system's cross-window blur over the live screen: no screenshot, no
- * capture delay, content keeps moving underneath.
+ * Live blur implementation.
  *
- * On devices that expose normal cross-window blur, the regular
- * WindowManager FLAG_BLUR_BEHIND path is used.
- *
- * On Samsung devices where that API reports disabled, an experimental
- * SurfaceFlinger blurRegions path is attempted instead.
+ * Normal Android devices use FLAG_BLUR_BEHIND.
+ * Samsung devices where cross-window blur reports disabled use the
+ * experimental SurfaceFlinger blurRegions backend.
  */
 class LiveBlurSurface(
     context: Context,
@@ -268,15 +295,16 @@ class LiveBlurSurface(
 
     private var fade: ValueAnimator? = null
 
-    /**
-     * 0..1 multiplier used by fade-in/out so a fade reads as the frost
-     * easing, not a popping window.
-     */
     private var fadeScale = 1f
 
     val attached: Boolean
 
     init {
+        Log.d(
+            TAG,
+            "LiveBlurSurface starting. normalWindowBlur=$normalWindowBlur"
+        )
+
         val bounds =
             windowManager.maximumWindowMetrics.bounds
 
@@ -297,10 +325,6 @@ class LiveBlurSurface(
             fold.movingSide
                 ?: config.movingSide
 
-        /*
-         * Work along the split axis:
-         * len is the screen extent across the hinge.
-         */
         val len =
             if (fold.splitsX) {
                 w
@@ -352,10 +376,6 @@ class LiveBlurSurface(
                         from + (i + 1) * step
                     }
 
-                /*
-                 * Distance from the hinge
-                 * at each edge of the strip.
-                 */
                 val dA =
                     kotlin.math.abs(
                         a - fold.position
@@ -366,11 +386,18 @@ class LiveBlurSurface(
                         b - fold.position
                     )
 
-                val (near, far) =
+                val near =
                     if (dA <= dB) {
-                        dA to dB
+                        dA
                     } else {
-                        dB to dA
+                        dB
+                    }
+
+                val far =
+                    if (dA <= dB) {
+                        dB
+                    } else {
+                        dA
                     }
 
                 val nearIsStart =
@@ -415,16 +442,26 @@ class LiveBlurSurface(
                         darkAtStart = nearIsStart,
                     )
 
+                val flags =
+                    if (normalWindowBlur) {
+                        WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                    } else {
+                        0
+                    }
+
                 val params =
                     overlayParams(
                         sw,
                         sh,
                         PixelFormat.TRANSLUCENT,
-                        WindowManager.LayoutParams.FLAG_BLUR_BEHIND,
+                        flags,
                     ).apply {
                         this.x = x
                         this.y = y
-                        blurBehindRadius = 0
+
+                        if (normalWindowBlur) {
+                            blurBehindRadius = 0
+                        }
                     }
 
                 val added =
@@ -464,6 +501,11 @@ class LiveBlurSurface(
             ok &&
                 strips.isNotEmpty()
 
+        Log.d(
+            TAG,
+            "LiveBlurSurface attached=$attached strips=${strips.size}"
+        )
+
         if (!attached) {
             detach()
         }
@@ -490,12 +532,6 @@ class LiveBlurSurface(
                 fadeScale
 
         for (strip in strips) {
-            /*
-             * Same law as the shader:
-             *
-             * radius = blurSpread * gap
-             * gap = distance * sin(tilt)
-             */
             val rNear =
                 config.blurSpread *
                     strip.dNear *
@@ -510,19 +546,18 @@ class LiveBlurSurface(
                 (
                     (
                         (
-                            rNear +
-                                rFar
-                            ) *
-                            0.5f
+                            (rNear + rFar) *
+                                0.5f
+                            )
+                            .coerceIn(
+                                0f,
+                                MAX_BLUR_PX,
+                            ) /
+                            RADIUS_STEP
                         )
-                        .coerceIn(
-                            0f,
-                            MAX_BLUR_PX,
-                        ) /
-                        RADIUS_STEP
+                        .roundToInt() *
+                        RADIUS_STEP.toInt()
                     )
-                    .roundToInt() *
-                    RADIUS_STEP.toInt()
 
             strip.view.setDarkening(
                 (
@@ -541,76 +576,104 @@ class LiveBlurSurface(
                 ),
             )
 
-            if (radius != strip.radius) {
-                strip.radius = radius
+            if (radius == strip.radius) {
+                continue
+            }
 
-                if (normalWindowBlur) {
-                    /*
-                     * Standard Android /
-                     * OnePlus path.
-                     */
-                    strip.params.blurBehindRadius =
-                        radius
+            strip.radius =
+                radius
 
-                    runCatching {
-                        windowManager.updateViewLayout(
-                            strip.view,
-                            strip.params,
-                        )
-                    }
-                } else {
-                    /*
-                     * Samsung experimental path:
-                     * SurfaceFlinger blurRegions.
-                     */
-                    val applied =
-                        SamsungBlurRegions.set(
-                            strip.view,
-                            strip.params.width,
-                            strip.params.height,
-                            radius,
-                        )
+            if (normalWindowBlur) {
+                strip.params.blurBehindRadius =
+                    radius
 
-                    /*
-                     * Directly after addView,
-                     * the SurfaceControl may not
-                     * be ready yet.
-                     */
-                    if (!applied) {
-                        strip.view.post {
-                            SamsungBlurRegions.set(
-                                strip.view,
-                                strip.params.width,
-                                strip.params.height,
-                                strip.radius,
-                            )
-                        }
-                    }
+                runCatching {
+                    windowManager.updateViewLayout(
+                        strip.view,
+                        strip.params,
+                    )
+                }.onFailure {
+                    Log.e(
+                        TAG,
+                        "Normal window blur update failed",
+                        it,
+                    )
                 }
+            } else {
+                applySamsungBlur(
+                    strip,
+                    radius,
+                )
+            }
+        }
+    }
+
+    private fun applySamsungBlur(
+        strip: Strip,
+        radius: Int,
+    ) {
+        val width =
+            strip.view.width
+                .takeIf { it > 0 }
+                ?: strip.params.width
+
+        val height =
+            strip.view.height
+                .takeIf { it > 0 }
+                ?: strip.params.height
+
+        val applied =
+            SamsungBlurRegions.set(
+                strip.view,
+                width,
+                height,
+                radius,
+            )
+
+        if (!applied) {
+            strip.view.post {
+                val retryWidth =
+                    strip.view.width
+                        .takeIf { it > 0 }
+                        ?: strip.params.width
+
+                val retryHeight =
+                    strip.view.height
+                        .takeIf { it > 0 }
+                        ?: strip.params.height
+
+                SamsungBlurRegions.set(
+                    strip.view,
+                    retryWidth,
+                    retryHeight,
+                    strip.radius,
+                )
             }
         }
     }
 
     override fun fadeIn(
         durationMs: Long,
-    ) =
+    ) {
         animateScale(
             0f,
             1f,
             durationMs,
             null,
         )
+    }
 
     override fun fadeOut(
         durationMs: Long,
         onEnd: () -> Unit,
-    ) =
+    ) {
         animateScale(
             fadeScale,
             0f,
             durationMs,
             onEnd,
         )
+    }
 
     private fun animateScale(
         from: Float,
@@ -672,10 +735,6 @@ class LiveBlurSurface(
         strips.clear()
     }
 
-    /**
-     * Translucent black gradient along the strip:
-     * darker the farther from the crease.
-     */
     private class StripView(
         context: Context,
         private val horizontal: Boolean,
@@ -813,16 +872,9 @@ class LiveBlurSurface(
         const val STRIPS =
             6
 
-        /**
-         * SurfaceFlinger blur gets expensive
-         * and flat beyond this.
-         */
         const val MAX_BLUR_PX =
             90f
 
-        /**
-         * Relayout only when the radius moves by this much.
-         */
         const val RADIUS_STEP =
             4f
 
