@@ -195,9 +195,7 @@ class PanelEngine(
     }
 
     /** Live blur needs no capture: the system blurs whatever is on screen. */
-    private fun liveMode(): Boolean =
-        DuoSettings.config.value.liveBlur &&
-            runCatching { windowManager.isCrossWindowBlurEnabled }.getOrDefault(false)
+    private fun liveMode(): Boolean = true
 
     private fun startEffect(afterSwap: Boolean, startTilt: Float? = null) {
         if (liveMode()) {
